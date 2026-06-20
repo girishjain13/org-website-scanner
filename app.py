@@ -10,21 +10,20 @@ import re
 from collections import defaultdict
 import time
 
-st.set_page_config(page_title="IA & Tech Audit Tool", layout="wide")
+st.set_page_config(page_title="Enterprise IA & Tech Audit Tool", layout="wide")
 
 # -----------------------------
-# 1. URL NORMALIZER (Prevents infinite loops from tracking codes)
+# 1. URL NORMALIZER & FILTER
 # -----------------------------
 def normalize_url(url):
     parsed = urlparse(url)
-    # Strips out ?utm_source=... and #anchors so we don't crawl the same page twice
     clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     if clean != parsed.scheme + "://" + parsed.netloc + "/":
         clean = clean.rstrip('/')
     return clean
 
 # -----------------------------
-# 2. FETCH & ANALYZE (Thread Worker)
+# 2. MEMORY-OPTIMIZED THREAD WORKER
 # -----------------------------
 def fetch_and_analyze(url, domain, integration_patterns):
     links = set()
@@ -32,9 +31,18 @@ def fetch_and_analyze(url, domain, integration_patterns):
     forms_found = []
     has_calculator = False
     
+    # FILTER: Ignore non-HTML files (PDFs, images) to save massive amounts of time and RAM
+    if any(url.lower().endswith(ext) for ext in ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.xml', '.css', '.js', '.doc', '.docx']):
+        return url, set(), set(), [], False
+
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, timeout=10, headers=headers)
+        
+        # Only parse if it's actually an HTML page
+        if 'text/html' not in res.headers.get('Content-Type', ''):
+            return url, set(), set(), [], False
+
         soup = BeautifulSoup(res.text, "html.parser")
         all_text = str(soup)
         
@@ -59,21 +67,23 @@ def fetch_and_analyze(url, domain, integration_patterns):
         if any(kw in all_text.lower() for kw in ['calculate', 'calculator', 'estimate', 'mortgage', 'bmi']):
             has_calculator = True
 
-    except:
+        # MEMORY FIX: Instantly delete the heavy HTML objects to free up RAM for the next page
+        del res, soup, all_text 
+
+    except Exception:
         pass
 
     return url, links, integrations_found, forms_found, has_calculator
 
 # -----------------------------
-# 3. PARALLEL CRAWLER (FIXED)
+# 3. PARALLEL CRAWLER
 # -----------------------------
-def crawl_site(start_url, max_workers=15, max_pages=500):
+def crawl_site(start_url, max_workers=15, max_pages=5000):
     domain = urlparse(start_url).netloc
     start_url = normalize_url(start_url)
     
     visited = set()
-    queued = {start_url} # FIX: Tracks what is in the queue to prevent infinite loops
-    
+    queued = {start_url} 
     edges = []
     queue = [start_url]
     
@@ -98,7 +108,7 @@ def crawl_site(start_url, max_workers=15, max_pages=500):
         queue = queue[max_workers:]
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(fetch_and_analyze, url, domain, integration_patterns) for url in batch]
+            futures = [executor.submit(fetch_and_analyze, u, domain, integration_patterns) for u in batch]
             
             for future in as_completed(futures):
                 url, links, integrations, forms, has_calc = future.result()
@@ -113,27 +123,26 @@ def crawl_site(start_url, max_workers=15, max_pages=500):
                 for link in links:
                     edges.append((url, link))
                     if link not in visited and link not in queued:
-                        queued.add(link) # FIX: Mark as queued immediately!
+                        queued.add(link)
                         queue.append(link)
                         
         progress = min(len(visited) / max_pages, 1.0)
         progress_bar.progress(progress)
-        status_text.text(f"🔄 Crawled Pages: {len(visited)} / {max_pages}")
+        status_text.text(f"🔄 Crawled Pages: {len(visited)} / {max_pages} | RAM Optimized")
         
     progress_bar.empty()
     status_text.empty()
     return visited, edges, all_integrations, all_forms, calc_pages
 
 # -----------------------------
-# 4. METRICS ENGINE (FIXED DEPTH)
+# 4. METRICS ENGINE
 # -----------------------------
 def calculate_metrics(start_url, pages, edges):
-    df_edges = pd.DataFrame(edges, columns=["From", "To"])
+    df_edges = pd.DataFrame(edges, columns=["From", "To"]) if edges else pd.DataFrame(columns=["From", "To"])
     linked_pages = set(df_edges["To"]) if not df_edges.empty else set()
     orphan_pages = set(pages) - linked_pages
     if start_url in orphan_pages: orphan_pages.remove(start_url) 
 
-    # FIX: Proper mathematical BFS Depth Calculation starting from Homepage
     depth_map = {start_url: 0}
     bfs_queue = [start_url]
     adj = defaultdict(list)
@@ -158,31 +167,22 @@ def calculate_metrics(start_url, pages, edges):
     return metrics, orphan_pages, df_edges, depth_map
 
 # -----------------------------
-# 5. INSIGHTS ENGINE
-# -----------------------------
-def generate_insights(metrics):
-    insights = []
-    if metrics["% Orphan Pages"] > 30: insights.append("⚠️ High orphan pages indicate weak internal linking structure.")
-    if metrics["Avg Navigation Depth"] > 4: insights.append("⚠️ Deep navigation increases user effort and impacts UX.")
-    if metrics["Total Pages Crawled"] > 500: insights.append("ℹ️ Large site size may require structured IA governance.")
-    if not insights: insights.append("✅ IA structure appears reasonably healthy.")
-    return insights
-
-# -----------------------------
-# 6. EXCEL REPORT
+# 5. EXCEL REPORT (LOW MEMORY MODE)
 # -----------------------------
 def generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs):
     output = BytesIO()
-    df_pages = pd.DataFrame(list(pages), columns=["Page URL"])
-    df_pages['Navigation Depth'] = df_pages['Page URL'].map(depth_map).fillna('Unreachable') # Adds your depth column!
     
-    df_edges = pd.DataFrame(edges, columns=["From", "To"])
+    df_pages = pd.DataFrame(list(pages), columns=["Page URL"])
+    df_pages['Navigation Depth'] = df_pages['Page URL'].map(depth_map).fillna('Unreachable')
+    
+    df_edges = pd.DataFrame(edges, columns=["From", "To"]) if edges else pd.DataFrame(columns=["From", "To"])
     df_metrics = pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"])
     df_int = pd.DataFrame([(k, len(v)) for k, v in integrations.items()], columns=["Integration", "Pages Found On"])
     df_forms = pd.DataFrame(forms) if forms else pd.DataFrame(columns=["Page URL", "Form Action", "Fields Count"])
     df_calcs = pd.DataFrame(calcs, columns=["Calculator Pages"]) if calcs else pd.DataFrame(columns=["Calculator Pages"])
 
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    # MEMORY FIX: constant_memory=True prevents Pandas from crashing RAM on massive files
+    with pd.ExcelWriter(output, engine="xlsxwriter", options={'constant_memory': True}) as writer:
         df_metrics.to_excel(writer, sheet_name="Dashboard", index=False)
         df_pages.to_excel(writer, sheet_name="Pages & Depth", index=False)
         df_edges.to_excel(writer, sheet_name="Link Graph", index=False)
@@ -194,13 +194,13 @@ def generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs)
     return output
 
 # -----------------------------
-# 7. WORD REPORT
+# 6. WORD REPORT
 # -----------------------------
 def generate_word(metrics, insights, integrations):
     doc = Document()
-    doc.add_heading("Website IA & Tech Audit Report", 0)
+    doc.add_heading("Enterprise IA & Tech Audit Report", 0)
     doc.add_heading("Executive Summary", 1)
-    doc.add_paragraph("This report analyzes the website's Information Architecture (navigation depth, orphan pages) and identifies third-party integrations, forms, and calculators.")
+    doc.add_paragraph("This report analyzes the website's Information Architecture and identifies third-party integrations, forms, and calculators.")
     doc.add_heading("Key Metrics", 1)
     for k, v in metrics.items(): doc.add_paragraph(f"{k}: {v}")
     doc.add_heading("Key Insights", 1)
@@ -215,28 +215,34 @@ def generate_word(metrics, insights, integrations):
     return buffer
 
 # -----------------------------
-# 8. USER INTERFACE
+# 7. USER INTERFACE
 # -----------------------------
-st.title("🌐 IA & Tech Audit Tool")
-st.markdown("Crawl a website to map URL depth, find orphan pages, and detect integrations/forms.")
+st.title("🌐 Enterprise IA & Tech Audit Tool")
+st.markdown("Crawl massive websites (up to 10,000+ pages) to map URL depth, find orphan pages, and detect integrations/forms.")
 
 col1, col2 = st.columns([3, 1])
 with col1: url = st.text_input("Enter Website URL (include https://)", "https://www.mediclinic.ae")
-with col2: max_pages = st.number_input("Max Pages", min_value=10, max_value=2000, value=200)
+with col2: 
+    # FIX: Limit removed! You can now type up to 100,000
+    max_pages = st.number_input("Max Pages", min_value=10, max_value=100000, value=500)
 
 workers = st.slider("Crawl Speed (Threads)", 5, 25, 12)
 
-if st.button("🚀 Start Audit"):
+if st.button("🚀 Start Enterprise Audit"):
     if not url: st.warning("Please enter a URL")
     else:
-        with st.spinner("Crawling site..."):
+        with st.spinner("Crawling site... (This may take several minutes for large sites)"):
             pages, edges, integrations, forms, calcs = crawl_site(url, max_workers=workers, max_pages=max_pages)
             
         if not pages: st.error("Could not crawl the website. Check the URL and try again.")
         else:
             metrics, orphan_pages, df_edges, depth_map = calculate_metrics(url, pages, edges)
-            insights = generate_insights(metrics)
             
+            insights = []
+            if metrics["% Orphan Pages"] > 30: insights.append("⚠️ High orphan pages indicate weak internal linking structure.")
+            if metrics["Avg Navigation Depth"] > 4: insights.append("⚠️ Deep navigation increases user effort and impacts UX.")
+            if not insights: insights.append("✅ IA structure appears reasonably healthy.")
+
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🔌 Integrations", "📝 Forms", "🧮 Calculators", "⚠️ Orphans"])
             with tab1:
                 st.subheader("Metrics"); st.json(metrics)
@@ -252,12 +258,11 @@ if st.button("🚀 Start Audit"):
                 else: st.write("No forms found.")
             with tab4:
                 st.subheader(f"Calculators Found ({len(calcs)})")
-                if calcs: st.write(calcs)
+                if calcs: st.write(calcs[:50])
                 else: st.write("No calculators found.")
             with tab5:
                 st.subheader(f"Orphan Pages ({len(orphan_pages)})")
-                st.write("Pages with no internal links pointing to them:")
-                st.write(list(orphan_pages)[:50])
+                st.write(list(orphan_pages)[:100])
                 
             st.subheader("📥 Download Full Reports")
             excel = generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs)

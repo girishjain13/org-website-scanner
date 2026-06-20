@@ -31,7 +31,7 @@ def fetch_and_analyze(url, domain, integration_patterns):
     forms_found = []
     has_calculator = False
     
-    # FILTER: Ignore non-HTML files (PDFs, images) to save massive amounts of time and RAM
+    # FILTER: Ignore non-HTML files to save time and RAM
     if any(url.lower().endswith(ext) for ext in ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.xml', '.css', '.js', '.doc', '.docx']):
         return url, set(), set(), [], False
 
@@ -67,7 +67,7 @@ def fetch_and_analyze(url, domain, integration_patterns):
         if any(kw in all_text.lower() for kw in ['calculate', 'calculator', 'estimate', 'mortgage', 'bmi']):
             has_calculator = True
 
-        # MEMORY FIX: Instantly delete the heavy HTML objects to free up RAM for the next page
+        # MEMORY FIX: Instantly delete heavy HTML objects to free up RAM
         del res, soup, all_text 
 
     except Exception:
@@ -167,7 +167,7 @@ def calculate_metrics(start_url, pages, edges):
     return metrics, orphan_pages, df_edges, depth_map
 
 # -----------------------------
-# 5. EXCEL REPORT (LOW MEMORY MODE)
+# 5. EXCEL REPORT (FIXED)
 # -----------------------------
 def generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs):
     output = BytesIO()
@@ -181,8 +181,8 @@ def generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs)
     df_forms = pd.DataFrame(forms) if forms else pd.DataFrame(columns=["Page URL", "Form Action", "Fields Count"])
     df_calcs = pd.DataFrame(calcs, columns=["Calculator Pages"]) if calcs else pd.DataFrame(columns=["Calculator Pages"])
 
-    # MEMORY FIX: constant_memory=True prevents Pandas from crashing RAM on massive files
-    with pd.ExcelWriter(output, engine="xlsxwriter", options={'constant_memory': True}) as writer:
+    # FIXED: Removed the broken 'options' parameter
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df_metrics.to_excel(writer, sheet_name="Dashboard", index=False)
         df_pages.to_excel(writer, sheet_name="Pages & Depth", index=False)
         df_edges.to_excel(writer, sheet_name="Link Graph", index=False)
@@ -218,17 +218,15 @@ def generate_word(metrics, insights, integrations):
 # 7. USER INTERFACE
 # -----------------------------
 st.title("🌐 Enterprise IA & Tech Audit Tool")
-st.markdown("Crawl massive websites (up to 10,000+ pages) to map URL depth, find orphan pages, and detect integrations/forms.")
+st.markdown("Crawl massive websites to map URL depth, find orphan pages, and detect integrations/forms.")
 
 col1, col2 = st.columns([3, 1])
 with col1: url = st.text_input("Enter Website URL (include https://)", "https://www.mediclinic.ae")
-with col2: 
-    # FIX: Limit removed! You can now type up to 100,000
-    max_pages = st.number_input("Max Pages", min_value=10, max_value=100000, value=500)
+with col2: max_pages = st.number_input("Max Pages", min_value=10, max_value=100000, value=500)
 
 workers = st.slider("Crawl Speed (Threads)", 5, 25, 12)
 
-if st.button("🚀 Start Enterprise Audit"):
+if st.button(" Start Enterprise Audit"):
     if not url: st.warning("Please enter a URL")
     else:
         with st.spinner("Crawling site... (This may take several minutes for large sites)"):
@@ -243,7 +241,7 @@ if st.button("🚀 Start Enterprise Audit"):
             if metrics["Avg Navigation Depth"] > 4: insights.append("⚠️ Deep navigation increases user effort and impacts UX.")
             if not insights: insights.append("✅ IA structure appears reasonably healthy.")
 
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🔌 Integrations", "📝 Forms", "🧮 Calculators", "⚠️ Orphans"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🔌 Integrations", "📝 Forms", "🧮 Calculators", "️ Orphans"])
             with tab1:
                 st.subheader("Metrics"); st.json(metrics)
                 st.subheader("Insights")

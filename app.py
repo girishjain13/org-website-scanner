@@ -10,7 +10,7 @@ import re
 from collections import defaultdict
 import time
 
-st.set_page_config(page_title="Enterprise IA & Tech Audit Tool", layout="wide")
+st.set_page_config(page_title="UX & IA Audit Tool", layout="wide")
 
 # -----------------------------
 # 1. URL NORMALIZER & FILTER
@@ -23,7 +23,31 @@ def normalize_url(url):
     return clean
 
 # -----------------------------
-# 2. MEMORY-OPTIMIZED THREAD WORKER
+# 2. CONTENT TYPE CLASSIFIER
+# -----------------------------
+def classify_content_type(url, soup):
+    url_lower = url.lower()
+    if any(x in url_lower for x in ['/blog/', '/article/', '/news/', '/post/']):
+        return 'Blog/Article'
+    elif any(x in url_lower for x in ['/product/', '/shop/', '/item/', '/store/']):
+        return 'Product Page'
+    elif any(x in url_lower for x in ['/landing/', '/campaign/', '/promo/']):
+        return 'Landing Page'
+    elif any(x in url_lower for x in ['/about/', '/team/', '/company/']):
+        return 'About Page'
+    elif any(x in url_lower for x in ['/contact/', '/support/', '/help/']):
+        return 'Contact/Support'
+    elif any(x in url_lower for x in ['/category/', '/tag/', '/archive/']):
+        return 'Category/Archive'
+    elif soup.find('article'):
+        return 'Blog/Article'
+    elif soup.find('form') and len(soup.find_all('input')) > 5:
+        return 'Form Page'
+    else:
+        return 'Standard Page'
+
+# -----------------------------
+# 3. UX/IA ANALYSIS WORKER
 # -----------------------------
 def fetch_and_analyze(url, domain, integration_patterns):
     links = set()
@@ -31,52 +55,146 @@ def fetch_and_analyze(url, domain, integration_patterns):
     forms_found = []
     has_calculator = False
     
-    # FILTER: Ignore non-HTML files to save time and RAM
+    # UX/IA Data
+    page_data = {
+        'url': url,
+        'title': '',
+        'meta_description': '',
+        'h1_count': 0,
+        'h1_text': [],
+        'h2_count': 0,
+        'h3_count': 0,
+        'word_count': 0,
+        'content_type': '',
+        'broken_links': [],
+        'redirects': [],
+        'cta_buttons': [],
+        'anchor_texts': [],
+        'images_without_alt': 0,
+        'forms_without_labels': 0,
+        'nav_links': [],
+        'footer_links': []
+    }
+    
+    # FILTER: Ignore non-HTML files
     if any(url.lower().endswith(ext) for ext in ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.xml', '.css', '.js', '.doc', '.docx']):
-        return url, set(), set(), [], False
+        return url, set(), set(), [], False, page_data
 
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, timeout=10, headers=headers)
+        res = requests.get(url, timeout=10, headers=headers, allow_redirects=True)
         
-        # Only parse if it's actually an HTML page
         if 'text/html' not in res.headers.get('Content-Type', ''):
-            return url, set(), set(), [], False
+            return url, set(), set(), [], False, page_data
+
+        # Track redirects
+        if len(res.history) > 0:
+            page_data['redirects'] = [r.url for r in res.history]
 
         soup = BeautifulSoup(res.text, "html.parser")
         all_text = str(soup)
         
-        # Find Links
+        # --- UX/IA ANALYSIS ---
+        
+        # Page Title & Meta
+        title_tag = soup.find('title')
+        page_data['title'] = title_tag.text.strip() if title_tag else 'Missing'
+        
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        page_data['meta_description'] = meta_desc.get('content', 'Missing') if meta_desc else 'Missing'
+        
+        # Heading Structure
+        h1_tags = soup.find_all('h1')
+        page_data['h1_count'] = len(h1_tags)
+        page_data['h1_text'] = [h1.get_text(strip=True) for h1 in h1_tags[:3]]
+        page_data['h2_count'] = len(soup.find_all('h2'))
+        page_data['h3_count'] = len(soup.find_all('h3'))
+        
+        # Word Count
+        body_text = soup.get_text(separator=' ', strip=True)
+        page_data['word_count'] = len(body_text.split())
+        
+        # Content Type
+        page_data['content_type'] = classify_content_type(url, soup)
+        
+        # Navigation Menus
+        nav = soup.find('nav') or soup.find('header')
+        if nav:
+            nav_links = [a.get_text(strip=True) for a in nav.find_all('a', href=True)[:20]]
+            page_data['nav_links'] = nav_links
+        
+        footer = soup.find('footer')
+        if footer:
+            footer_links = [a.get_text(strip=True) for a in footer.find_all('a', href=True)[:20]]
+            page_data['footer_links'] = footer_links
+        
+        # CTA Buttons
+        cta_keywords = ['sign up', 'get started', 'buy now', 'learn more', 'contact', 'download', 'subscribe', 'register']
+        for button in soup.find_all(['button', 'a']):
+            button_text = button.get_text(strip=True).lower()
+            if any(kw in button_text for kw in cta_keywords):
+                page_data['cta_buttons'].append(button.get_text(strip=True)[:50])
+        
+        # --- LINK ANALYSIS ---
         for link in soup.find_all("a", href=True):
             absolute = urljoin(url, link['href'])
+            anchor_text = link.get_text(strip=True)
+            
+            # Internal links
             if urlparse(absolute).netloc == domain:
                 links.add(normalize_url(absolute))
+                if anchor_text:
+                    page_data['anchor_texts'].append(anchor_text[:50])
                 
+                # Check for broken links (quick check)
+                try:
+                    link_res = requests.head(absolute, timeout=3, allow_redirects=True)
+                    if link_res.status_code == 404:
+                        page_data['broken_links'].append(absolute)
+                except:
+                    pass
+        
+        # --- FORMS & ACCESSIBILITY ---
+        for form in soup.find_all("form"):
+            fields = form.find_all(['input', 'textarea', 'select'])
+            fields_without_labels = 0
+            for field in fields:
+                if field.get('type') not in ['hidden', 'submit', 'button']:
+                    field_id = field.get('id')
+                    if field_id and not soup.find('label', attrs={'for': field_id}):
+                        fields_without_labels += 1
+            
+            if len(fields) > 0:
+                forms_found.append({
+                    "Page URL": url, 
+                    "Form Action": form.get('action', 'None'), 
+                    "Fields Count": len(fields),
+                    "Fields Without Labels": fields_without_labels
+                })
+                page_data['forms_without_labels'] += fields_without_labels
+        
+        # Images without alt text
+        images = soup.find_all('img')
+        page_data['images_without_alt'] = sum(1 for img in images if not img.get('alt'))
+        
         # Find Integrations
         for name, patterns in integration_patterns.items():
             if any(re.search(p, all_text, re.I) for p in patterns):
                 integrations_found.add(name)
                 
-        # Find Forms
-        for form in soup.find_all("form"):
-            fields = len(form.find_all(['input', 'textarea', 'select']))
-            if fields > 0:
-                forms_found.append({"Page URL": url, "Form Action": form.get('action', 'None'), "Fields Count": fields})
-                
         # Find Calculators
         if any(kw in all_text.lower() for kw in ['calculate', 'calculator', 'estimate', 'mortgage', 'bmi']):
             has_calculator = True
 
-        # MEMORY FIX: Instantly delete heavy HTML objects to free up RAM
         del res, soup, all_text 
 
-    except Exception:
+    except Exception as e:
         pass
 
-    return url, links, integrations_found, forms_found, has_calculator
+    return url, links, integrations_found, forms_found, has_calculator, page_data
 
 # -----------------------------
-# 3. PARALLEL CRAWLER
+# 4. PARALLEL CRAWLER
 # -----------------------------
 def crawl_site(start_url, max_workers=15, max_pages=5000):
     domain = urlparse(start_url).netloc
@@ -90,6 +208,7 @@ def crawl_site(start_url, max_workers=15, max_pages=5000):
     all_integrations = defaultdict(set)
     all_forms = []
     calc_pages = []
+    all_page_data = []
     
     integration_patterns = {
         'Google Analytics': [r'google-analytics\.com', r'googletagmanager\.com'],
@@ -111,10 +230,12 @@ def crawl_site(start_url, max_workers=15, max_pages=5000):
             futures = [executor.submit(fetch_and_analyze, u, domain, integration_patterns) for u in batch]
             
             for future in as_completed(futures):
-                url, links, integrations, forms, has_calc = future.result()
+                url, links, integrations, forms, has_calc, page_data = future.result()
                 
                 if url in visited: continue
                 visited.add(url)
+                
+                all_page_data.append(page_data)
                 
                 for name in integrations: all_integrations[name].add(url)
                 all_forms.extend(forms)
@@ -128,142 +249,6 @@ def crawl_site(start_url, max_workers=15, max_pages=5000):
                         
         progress = min(len(visited) / max_pages, 1.0)
         progress_bar.progress(progress)
-        status_text.text(f"🔄 Crawled Pages: {len(visited)} / {max_pages} | RAM Optimized")
+        status_text.text(f"🔄 Crawled Pages: {len(visited)} / {max_pages} | UX/IA Analysis Active")
         
     progress_bar.empty()
-    status_text.empty()
-    return visited, edges, all_integrations, all_forms, calc_pages
-
-# -----------------------------
-# 4. METRICS ENGINE
-# -----------------------------
-def calculate_metrics(start_url, pages, edges):
-    df_edges = pd.DataFrame(edges, columns=["From", "To"]) if edges else pd.DataFrame(columns=["From", "To"])
-    linked_pages = set(df_edges["To"]) if not df_edges.empty else set()
-    orphan_pages = set(pages) - linked_pages
-    if start_url in orphan_pages: orphan_pages.remove(start_url) 
-
-    depth_map = {start_url: 0}
-    bfs_queue = [start_url]
-    adj = defaultdict(list)
-    for frm, to in edges: adj[frm].append(to)
-        
-    while bfs_queue:
-        current = bfs_queue.pop(0)
-        for neighbor in adj[current]:
-            if neighbor not in depth_map:
-                depth_map[neighbor] = depth_map[current] + 1
-                bfs_queue.append(neighbor)
-                
-    avg_depth = sum(depth_map.values()) / len(depth_map) if depth_map else 0
-
-    metrics = {
-        "Total Pages Crawled": len(pages),
-        "Total Internal Links": len(edges),
-        "Orphan Pages": len(orphan_pages),
-        "% Orphan Pages": round((len(orphan_pages)/len(pages))*100, 2) if pages else 0,
-        "Avg Navigation Depth": round(avg_depth, 2)
-    }
-    return metrics, orphan_pages, df_edges, depth_map
-
-# -----------------------------
-# 5. EXCEL REPORT (FIXED)
-# -----------------------------
-def generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs):
-    output = BytesIO()
-    
-    df_pages = pd.DataFrame(list(pages), columns=["Page URL"])
-    df_pages['Navigation Depth'] = df_pages['Page URL'].map(depth_map).fillna('Unreachable')
-    
-    df_edges = pd.DataFrame(edges, columns=["From", "To"]) if edges else pd.DataFrame(columns=["From", "To"])
-    df_metrics = pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"])
-    df_int = pd.DataFrame([(k, len(v)) for k, v in integrations.items()], columns=["Integration", "Pages Found On"])
-    df_forms = pd.DataFrame(forms) if forms else pd.DataFrame(columns=["Page URL", "Form Action", "Fields Count"])
-    df_calcs = pd.DataFrame(calcs, columns=["Calculator Pages"]) if calcs else pd.DataFrame(columns=["Calculator Pages"])
-
-    # FIXED: Removed the broken 'options' parameter
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_metrics.to_excel(writer, sheet_name="Dashboard", index=False)
-        df_pages.to_excel(writer, sheet_name="Pages & Depth", index=False)
-        df_edges.to_excel(writer, sheet_name="Link Graph", index=False)
-        df_int.to_excel(writer, sheet_name="Integrations", index=False)
-        df_forms.to_excel(writer, sheet_name="Forms", index=False)
-        df_calcs.to_excel(writer, sheet_name="Calculators", index=False)
-
-    output.seek(0)
-    return output
-
-# -----------------------------
-# 6. WORD REPORT
-# -----------------------------
-def generate_word(metrics, insights, integrations):
-    doc = Document()
-    doc.add_heading("Enterprise IA & Tech Audit Report", 0)
-    doc.add_heading("Executive Summary", 1)
-    doc.add_paragraph("This report analyzes the website's Information Architecture and identifies third-party integrations, forms, and calculators.")
-    doc.add_heading("Key Metrics", 1)
-    for k, v in metrics.items(): doc.add_paragraph(f"{k}: {v}")
-    doc.add_heading("Key Insights", 1)
-    for i in insights: doc.add_paragraph(i)
-    doc.add_heading("Third-Party Integrations Found", 1)
-    if integrations:
-        for name, urls in integrations.items(): doc.add_paragraph(f"{name}: Found on {len(urls)} pages.")
-    else: doc.add_paragraph("No major third-party integrations detected.")
-    buffer = BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer
-
-# -----------------------------
-# 7. USER INTERFACE
-# -----------------------------
-st.title("🌐 Enterprise IA & Tech Audit Tool")
-st.markdown("Crawl massive websites to map URL depth, find orphan pages, and detect integrations/forms.")
-
-col1, col2 = st.columns([3, 1])
-with col1: url = st.text_input("Enter Website URL (include https://)", "https://www.mediclinic.ae")
-with col2: max_pages = st.number_input("Max Pages", min_value=10, max_value=100000, value=500)
-
-workers = st.slider("Crawl Speed (Threads)", 5, 25, 12)
-
-if st.button(" Start Enterprise Audit"):
-    if not url: st.warning("Please enter a URL")
-    else:
-        with st.spinner("Crawling site... (This may take several minutes for large sites)"):
-            pages, edges, integrations, forms, calcs = crawl_site(url, max_workers=workers, max_pages=max_pages)
-            
-        if not pages: st.error("Could not crawl the website. Check the URL and try again.")
-        else:
-            metrics, orphan_pages, df_edges, depth_map = calculate_metrics(url, pages, edges)
-            
-            insights = []
-            if metrics["% Orphan Pages"] > 30: insights.append("⚠️ High orphan pages indicate weak internal linking structure.")
-            if metrics["Avg Navigation Depth"] > 4: insights.append("⚠️ Deep navigation increases user effort and impacts UX.")
-            if not insights: insights.append("✅ IA structure appears reasonably healthy.")
-
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🔌 Integrations", "📝 Forms", "🧮 Calculators", "️ Orphans"])
-            with tab1:
-                st.subheader("Metrics"); st.json(metrics)
-                st.subheader("Insights")
-                for i in insights: st.write(i)
-            with tab2:
-                st.subheader(f"Integrations Found ({len(integrations)})")
-                for name, urls in integrations.items():
-                    with st.expander(f"🔹 {name} ({len(urls)} pages)"): st.write(list(urls)[:10])
-            with tab3:
-                st.subheader(f"Forms Found ({len(forms)})")
-                if forms: st.dataframe(pd.DataFrame(forms), use_container_width=True)
-                else: st.write("No forms found.")
-            with tab4:
-                st.subheader(f"Calculators Found ({len(calcs)})")
-                if calcs: st.write(calcs[:50])
-                else: st.write("No calculators found.")
-            with tab5:
-                st.subheader(f"Orphan Pages ({len(orphan_pages)})")
-                st.write(list(orphan_pages)[:100])
-                
-            st.subheader("📥 Download Full Reports")
-            excel = generate_excel(pages, edges, metrics, depth_map, integrations, forms, calcs)
-            st.download_button("Download Excel Report", excel, "IA_Tech_Report.xlsx", type="primary")
-            word = generate_word(metrics, insights, integrations)
-            st.download_button("Download Word Report", word, "IA_Tech_Report.docx")
